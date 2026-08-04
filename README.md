@@ -18,6 +18,7 @@ payment-service/
 │ ├── service.py
 │ ├── provider.py
 │ ├── scheduler.py
+│ ├── metrics.py
 │ └── logging_config.py
 └── tests/
 ├── init.py
@@ -48,6 +49,25 @@ GET /health.
 Ответ: 200 OK
 json
 {"status":"healthy"}
+
+GET /metrics.
+Получение метрик сервиса.
+Ответ: 200 OK
+json
+{
+  "operations_total": 5,
+  "operations_created": 5,
+  "operations_processing": 2,
+  "operations_completed": 3,
+  "operations_rejected": 0,
+  "retry_attempts": 1,
+  "provider_errors": 0,
+  "receipts_processed": 3,
+  "receipts_ignored": 0,
+  "recoveries": 1,
+  "operations_processing_current": 0,
+  "stuck_operations": 0
+}
 
 POST /operations.
 Создание новой платёжной операции.
@@ -208,6 +228,8 @@ curl -X POST http://localhost:8080/operations/success-test-1/submit
 curl http://localhost:8080/operations/success-test-1
 ## Проверка истории.
 curl http://localhost:8080/operations/success-test-1/events
+## Проверка метрик.
+curl http://localhost:8080/metrics
 
 Сценарий 2: Отказ платежа.
 # Создание операции с суммой, вызывающей отказ
@@ -283,6 +305,8 @@ curl -X POST http://localhost:8080/operations/recovery-test-1/submit
 docker compose restart candidate-service
 # Проверка восстановления операции.
 curl http://localhost:8080/operations/recovery-test-1
+# Проверка логов восстановления.
+docker compose logs candidate-service | grep "recovery"
 
 Сценарий 6: Проверка сохранности данных.
 # Создание операции.
@@ -300,6 +324,21 @@ docker compose down
 docker compose up -d
 # Проверка сохранности данных.
 curl http://localhost:8080/operations/persist-test-1
+
+Сценарий 7: Проверка retry с attempt.
+# Создание операции.
+curl -X POST http://localhost:8080/operations \
+  -H "Content-Type: application/json" \
+  -d '{
+    "operationId": "retry-test-1",
+    "amount": "1000.00",
+    "currency": "RUB",
+    "description": "Retry test"
+  }'
+# Отправка.
+curl -X POST http://localhost:8080/operations/retry-test-1/submit
+# Просмотр логов с attempt.
+docker compose logs candidate-service | grep "retry-test-1" | grep "attempt"
 
 # Тестирование.
 ## Запуск тестов.
@@ -326,7 +365,8 @@ test_recovery.py	  Тестирование восстановления и со
   "logger": "src.service",
   "message": "Processing payment operation-123",
   "operation_id": "operation-123",
-  "provider_payment_id": "aa5b7856-e9f2-4fd5-955b-38b1f28d9c57"
+  "provider_payment_id": "aa5b7856-e9f2-4fd5-955b-38b1f28d9c57",
+  "attempt": 1
 }
 
 # Просмотр логов:
@@ -336,6 +376,8 @@ docker compose logs -f candidate-service
 docker compose logs candidate-service | grep "operation-123"
 ## Только ошибки.
 docker compose logs candidate-service | grep ERROR
+## Логи с attempt (retry).
+docker compose logs candidate-service | grep "attempt"
 
 # База данных.
 Используется SQLite с постоянным томом. Данные сохраняются при перезапуске контейнеров.
@@ -350,7 +392,10 @@ processed_receipts	   Обработанные квитанции для про�
 2. Атомарность: сохранение состояния до внешнего вызова провайдера.
 3. Восстановление: автоматическое продолжение обработки после перезапуска.
 4. Конкурентность: блокировки на уровне БД предотвращают двойную обработку.
-5. Retry: экспоненциальная задержка с jitter при сетевых ошибках.
+5. Retry: экспоненциальная задержка с jitter (0-0.5с) при сетевых ошибках, до 5 попыток.
+6. Структурированные логи: JSON формат с полями operation_id, provider_payment_id, attempt.
+7. Метрики: эндпоинт /metrics для мониторинга состояния сервиса.
+8. Graceful Shutdown: корректное завершение фоновых задач при остановке.
 
 # Коды ответов API.
 Код	   Описание.
@@ -369,7 +414,7 @@ FastAPI	           0.115.6	Веб-фреймворк.
 Uvicorn	           0.34.0	ASGI сервер.
 aiosqlite	       0.20.0	Асинхронный драйвер SQLite.
 httpx	           0.28.1	HTTP клиент.
-tenacity	       9.0.0	Retry с backoff.
+tenacity	       9.0.0	Retry с backoff и jitter.
 pytest	           8.3.4	Тестирование.
 pytest-asyncio	   0.24.0	Асинхронные тесты.
 
