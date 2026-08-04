@@ -17,6 +17,8 @@ class JSONFormatter(logging.Formatter):
             log_entry["operation_id"] = record.operation_id
         if hasattr(record, "provider_payment_id"):
             log_entry["provider_payment_id"] = record.provider_payment_id
+        if hasattr(record, "attempt"):
+            log_entry["attempt"] = record.attempt
 
         if record.exc_info:
             log_entry["exception"] = self.formatException(record.exc_info)
