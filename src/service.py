@@ -7,11 +7,14 @@ import asyncio
 from src.models import Operation, OperationStatus, Event, Receipt
 from src.database import db
 from src.provider import ProviderClient
+from src.metrics import metrics
 
 logger = logging.getLogger(__name__)
 
 
 class PaymentService:
+    """Core payment service with idempotent operations."""
+
     def __init__(self):
         self.provider = ProviderClient()
         self._processing_tasks = {}
@@ -23,15 +26,31 @@ class PaymentService:
             currency: str,
             description: str
     ) -> Operation:
-        """Create new operation."""
+        """
+        Create new payment operation.
+
+        Args:
+            operation_id: Unique operation identifier.
+            amount: Payment amount as string.
+            currency: Currency code (RUB).
+            description: Operation description.
+
+        Returns:
+            Created Operation object.
+
+        Raises:
+            ConflictError: If operation already exists.
+            ValueError: If validation fails.
+        """
         async with db.get_connection() as conn:
-            # Check if exists.
+            # Check if operation already exists.
             cursor = await conn.execute(
                 "SELECT * FROM operations WHERE operation_id = ?",
                 (operation_id,)
             )
             existing = await cursor.fetchone()
             if existing:
+                metrics.increment("operations_conflict")
                 raise ConflictError(f"Operation {operation_id} already exists")
 
             # Validate amount.
@@ -67,6 +86,19 @@ class PaymentService:
 
             await conn.commit()
 
+            # Update metrics.
+            metrics.increment("operations_total")
+            metrics.increment("operations_created")
+
+            logger.info(
+                f"Operation {operation_id} created",
+                extra={
+                    "operation_id": operation_id,
+                    "amount": amount,
+                    "currency": currency
+                }
+            )
+
             return Operation(
                 operation_id=operation_id,
                 amount=amount_dec,
@@ -79,7 +111,15 @@ class PaymentService:
             )
 
     async def submit_operation(self, operation_id: str) -> Tuple[Operation, bool]:
-        """Submit operation for processing."""
+        """
+        Submit operation for processing.
+
+        Args:
+            operation_id: Operation identifier.
+
+        Returns:
+            Tuple of (Operation, bool) where bool indicates if new submission was created.
+        """
         async with db.get_connection() as conn:
             # Get operation with lock.
             cursor = await conn.execute(
@@ -94,6 +134,13 @@ class PaymentService:
 
             # If already PROCESSING or final, return current state.
             if operation.status in [OperationStatus.PROCESSING, OperationStatus.COMPLETED, OperationStatus.REJECTED]:
+                logger.info(
+                    f"Operation {operation_id} already in status {operation.status}",
+                    extra={
+                        "operation_id": operation_id,
+                        "status": operation.status.value
+                    }
+                )
                 return operation, False
 
             if operation.status != OperationStatus.CREATED:
@@ -118,6 +165,13 @@ class PaymentService:
 
             if updated.status != OperationStatus.PROCESSING:
                 # Another request already changed it.
+                logger.info(
+                    f"Operation {operation_id} already changed to {updated.status}",
+                    extra={
+                        "operation_id": operation_id,
+                        "status": updated.status.value
+                    }
+                )
                 return updated, False
 
             # Add event.
@@ -130,8 +184,22 @@ class PaymentService:
             )
             await conn.commit()
 
+            # Update metrics.
+            metrics.set_processing(operation_id)
+            metrics.increment("operations_processing")
+
+            logger.info(
+                f"Operation {operation_id} submitted for processing",
+                extra={
+                    "operation_id": operation_id,
+                    "status": OperationStatus.PROCESSING.value
+                }
+            )
+
             # Schedule async processing.
-            asyncio.create_task(self._process_payment_async(operation_id))
+            task = asyncio.create_task(self._process_payment_async(operation_id))
+            self._processing_tasks[operation_id] = task
+            task.add_done_callback(lambda t: self._processing_tasks.pop(operation_id, None))
 
             return updated, True
 
@@ -142,11 +210,18 @@ class PaymentService:
             await asyncio.sleep(0.1)
             await self.process_payment(operation_id)
         except Exception as e:
-            logger.error(f"Error processing payment {operation_id}: {e}")
+            logger.error(
+                f"Error processing payment {operation_id}: {e}",
+                extra={"operation_id": operation_id},
+                exc_info=True
+            )
 
     async def process_payment(self, operation_id: str):
         """Process payment with provider."""
-        logger.info(f"Processing payment {operation_id}")
+        logger.info(
+            f"Processing payment {operation_id}",
+            extra={"operation_id": operation_id}
+        )
 
         # Get operation.
         async with db.get_connection() as conn:
@@ -156,22 +231,36 @@ class PaymentService:
             )
             row = await cursor.fetchone()
             if not row:
-                logger.error(f"Operation {operation_id} not found")
+                logger.error(
+                    f"Operation {operation_id} not found",
+                    extra={"operation_id": operation_id}
+                )
                 return
 
             operation = self._row_to_operation(row)
 
             if operation.status != OperationStatus.PROCESSING:
-                logger.info(f"Operation {operation_id} is no longer PROCESSING, skipping")
+                logger.info(
+                    f"Operation {operation_id} is no longer PROCESSING, skipping",
+                    extra={
+                        "operation_id": operation_id,
+                        "status": operation.status.value
+                    }
+                )
                 return
 
             # Check if already has provider_payment_id from callback.
             if operation.provider_payment_id:
                 logger.info(
-                    f"Operation {operation_id} already has provider_payment_id: {operation.provider_payment_id}")
+                    f"Operation {operation_id} already has provider_payment_id: {operation.provider_payment_id}",
+                    extra={
+                        "operation_id": operation_id,
+                        "provider_payment_id": operation.provider_payment_id
+                    }
+                )
                 return
 
-        # Call provider.
+        # Call provider with retry.
         try:
             result = await self.provider.create_payment(
                 operation_id=operation_id,
@@ -185,18 +274,40 @@ class PaymentService:
                     """UPDATE operations 
                        SET provider_payment_id = ?, updated_at = ?
                        WHERE operation_id = ? AND provider_payment_id IS NULL""",
-                    (result.provider_payment_id, datetime.now(timezone.utc).isoformat(), operation_id)
+                    (result["provider_payment_id"], datetime.now(timezone.utc).isoformat(), operation_id)
                 )
                 await conn.commit()
 
-            logger.info(f"Payment {operation_id} accepted by provider: {result.provider_payment_id}")
+            # Reset provider retry counter on success.
+            self.provider.reset_retry_count()
+
+            logger.info(
+                f"Payment {operation_id} accepted by provider: {result['provider_payment_id']}",
+                extra={
+                    "operation_id": operation_id,
+                    "provider_payment_id": result["provider_payment_id"]
+                }
+            )
 
         except Exception as e:
-            logger.error(f"Error calling provider for {operation_id}: {e}")
+            metrics.increment("provider_errors")
+            logger.error(
+                f"Error calling provider for {operation_id}: {e}",
+                extra={"operation_id": operation_id},
+                exc_info=True
+            )
             # Operation stays PROCESSING for retry.
 
     async def process_receipt(self, receipt_data: Dict) -> bool:
-        """Process callback receipt."""
+        """
+        Process callback receipt from provider.
+
+        Args:
+            receipt_data: Receipt data from provider.
+
+        Returns:
+            True if receipt was processed successfully.
+        """
         receipt = Receipt(
             provider_payment_id=receipt_data["providerPaymentId"],
             operation_id=receipt_data["operationId"],
@@ -206,10 +317,16 @@ class PaymentService:
             processed_at=datetime.now(timezone.utc)
         )
 
-        logger.info(f"Processing receipt for operation {receipt.operation_id}, result: {receipt.result}")
+        logger.info(
+            f"Processing receipt for operation {receipt.operation_id}, result: {receipt.result}",
+            extra={
+                "operation_id": receipt.operation_id,
+                "provider_payment_id": receipt.provider_payment_id
+            }
+        )
 
         async with db.get_connection() as conn:
-            # Start transaction.
+            # Start transaction
             await conn.execute("BEGIN")
 
             try:
@@ -220,8 +337,15 @@ class PaymentService:
                 )
                 existing_receipt = await cursor.fetchone()
                 if existing_receipt:
-                    logger.info(f"Receipt {receipt.provider_payment_id} already processed")
+                    logger.info(
+                        f"Receipt {receipt.provider_payment_id} already processed",
+                        extra={
+                            "operation_id": receipt.operation_id,
+                            "provider_payment_id": receipt.provider_payment_id
+                        }
+                    )
                     await conn.commit()
+                    metrics.increment("receipts_duplicate")
                     return True
 
                 # Get operation.
@@ -231,7 +355,10 @@ class PaymentService:
                 )
                 row = await cursor.fetchone()
                 if not row:
-                    logger.error(f"Operation {receipt.operation_id} not found")
+                    logger.error(
+                        f"Operation {receipt.operation_id} not found",
+                        extra={"operation_id": receipt.operation_id}
+                    )
                     await conn.commit()
                     return False
 
@@ -239,23 +366,42 @@ class PaymentService:
                 status_result = OperationStatus(receipt.result) if receipt.result in ["COMPLETED", "REJECTED"] else None
 
                 if not status_result:
-                    logger.error(f"Invalid result: {receipt.result}")
+                    logger.error(
+                        f"Invalid result: {receipt.result}",
+                        extra={
+                            "operation_id": receipt.operation_id,
+                            "result": receipt.result
+                        }
+                    )
                     await conn.commit()
                     return False
 
                 # Check if operation already final.
                 if operation.status in [OperationStatus.COMPLETED, OperationStatus.REJECTED]:
-                    logger.info(f"Operation {receipt.operation_id} already final: {operation.status}")
+                    logger.info(
+                        f"Operation {receipt.operation_id} already final: {operation.status}",
+                        extra={
+                            "operation_id": receipt.operation_id,
+                            "status": operation.status.value
+                        }
+                    )
 
                     # Store receipt as processed anyway.
                     await self._store_receipt(conn, receipt, "IGNORED")
                     await conn.commit()
+                    metrics.increment("receipts_ignored")
                     return True
 
                 # Check provider_payment_id consistency.
                 if operation.provider_payment_id and operation.provider_payment_id != receipt.provider_payment_id:
                     logger.error(
-                        f"Provider payment ID mismatch: {operation.provider_payment_id} != {receipt.provider_payment_id}")
+                        f"Provider payment ID mismatch: {operation.provider_payment_id} != {receipt.provider_payment_id}",
+                        extra={
+                            "operation_id": receipt.operation_id,
+                            "expected": operation.provider_payment_id,
+                            "received": receipt.provider_payment_id
+                        }
+                    )
                     await conn.commit()
                     return False
 
@@ -267,9 +413,16 @@ class PaymentService:
                 processed = await cursor.fetchone()
                 if processed and processed["result"] != receipt.result:
                     logger.warning(
-                        f"Operation {receipt.operation_id} already has result {processed['result']}, ignoring {receipt.result}")
+                        f"Operation {receipt.operation_id} already has result {processed['result']}, ignoring {receipt.result}",
+                        extra={
+                            "operation_id": receipt.operation_id,
+                            "existing_result": processed["result"],
+                            "new_result": receipt.result
+                        }
+                    )
                     await self._store_receipt(conn, receipt, "IGNORED")
                     await conn.commit()
+                    metrics.increment("receipts_conflict")
                     return True
 
                 # Update operation.
@@ -302,13 +455,33 @@ class PaymentService:
                 )
 
                 await conn.commit()
-                logger.info(f"Operation {receipt.operation_id} updated to {status_result.value}")
+
+                # Update metrics.
+                metrics.remove_processing(receipt.operation_id)
+                metrics.increment("receipts_processed")
+                if status_result == OperationStatus.COMPLETED:
+                    metrics.increment("operations_completed")
+                else:
+                    metrics.increment("operations_rejected")
+
+                logger.info(
+                    f"Operation {receipt.operation_id} updated to {status_result.value}",
+                    extra={
+                        "operation_id": receipt.operation_id,
+                        "status": status_result.value,
+                        "provider_payment_id": receipt.provider_payment_id
+                    }
+                )
 
                 return True
 
             except Exception as e:
                 await conn.rollback()
-                logger.error(f"Error processing receipt: {e}")
+                logger.error(
+                    f"Error processing receipt: {e}",
+                    extra={"operation_id": receipt.operation_id},
+                    exc_info=True
+                )
                 raise
 
     async def _store_receipt(self, conn, receipt: Receipt, status: str):
@@ -356,6 +529,7 @@ class PaymentService:
             return [self._row_to_operation(row) for row in rows]
 
     def _row_to_operation(self, row) -> Operation:
+        """Convert database row to Operation object."""
         return Operation(
             operation_id=row["operation_id"],
             amount=Decimal(row["amount"]),
@@ -368,6 +542,7 @@ class PaymentService:
         )
 
     def _row_to_event(self, row) -> Event:
+        """Convert database row to Event object."""
         return Event(
             event_id=row["event_id"],
             operation_id=row["operation_id"],
@@ -378,10 +553,35 @@ class PaymentService:
             occurred_at=datetime.fromisoformat(row["occurred_at"])
         )
 
+    async def shutdown(self):
+        """Graceful shutdown of service."""
+        logger.info("Shutting down payment service")
+
+        # Cancel all processing tasks.
+        if self._processing_tasks:
+            logger.info(f"Cancelling {len(self._processing_tasks)} processing tasks")
+            for task in self._processing_tasks.values():
+                if not task.done():
+                    task.cancel()
+
+            # Wait for tasks to complete.
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*self._processing_tasks.values(), return_exceptions=True),
+                    timeout=10
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Timeout waiting for processing tasks")
+
+        await self.provider.close()
+        logger.info("Payment service shutdown complete")
+
 
 class NotFoundError(Exception):
+    """Raised when operation is not found."""
     pass
 
 
 class ConflictError(Exception):
+    """Raised when operation already exists."""
     pass
