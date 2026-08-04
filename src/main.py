@@ -14,6 +14,7 @@ from src.models import OperationStatus
 from src.service import PaymentService, NotFoundError, ConflictError
 from src.scheduler import Scheduler
 from src.logging_config import setup_logging
+from src.metrics import metrics
 
 # Setup logging.
 setup_logging()
@@ -49,6 +50,12 @@ app = FastAPI(lifespan=lifespan)
 async def health():
     """Health check endpoint."""
     return {"status": "healthy"}
+
+
+@app.get("/metrics")
+async def get_metrics():
+    """Get service metrics."""
+    return metrics.get_metrics()
 
 
 @app.post("/operations", status_code=201)
