@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  candidate-service:
+    build: .
+    environment:
+      PROVIDER_URL: http://provider-simulator:8081
+      PYTHONUNBUFFERED: 1
+    ports:
+      - "8080:8080"
+    volumes:
+      - candidate-data:/data
+    networks:
+      - payment-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  provider-simulator:
+    image: ghcr.io/fintech-dev-lab/internship-provider-simulator:v0.2.0
+    environment:
+      CALLBACK_URL: http://candidate-service:8080/receipts
+    ports:
+      - "8081:8081"
+    networks:
+      - payment-network
+    depends_on:
+      - candidate-service
+    restart: unless-stopped
+
+networks:
+  payment-network:
+    driver: bridge
+
+volumes:
+  candidate-data:
