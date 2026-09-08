@@ -1,0 +1,43 @@
+services:
+  candidate-service:
+    build: .
+    environment:
+      PROVIDER_URL: http://provider-simulator:8081
+      DATABASE_PATH: /data/payments.db
+      PYTHONUNBUFFERED: 1
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    volumes:
+      - candidate-data:/data
+    networks:
+      - payment-network
+    healthcheck:
+      # Раньше здесь был `curl`, которого нет в python:slim-образе
+      # (Dockerfile его не ставит) — healthcheck всегда падал бы с
+      # "curl: command not found". Python в контейнере точно есть,
+      # используем его вместо добавления лишнего пакета в образ.
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  provider-simulator:
+    image: ghcr.io/fintech-dev-lab/internship-provider-simulator:v0.2.0
+    environment:
+      CALLBACK_URL: http://candidate-service:8080/receipts
+    ports:
+      - "8081:8081"
+    networks:
+      - payment-network
+    depends_on:
+      - candidate-service
+    restart: unless-stopped
+
+networks:
+  payment-network:
+    driver: bridge
+
+volumes:
+  candidate-data:
