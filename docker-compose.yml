@@ -1,5 +1,5 @@
 services:
-  candidate-service:
+  payment-service:
     build: .
     environment:
       PROVIDER_URL: http://provider-simulator:8081
@@ -26,13 +26,13 @@ services:
   provider-simulator:
     image: ghcr.io/fintech-dev-lab/internship-provider-simulator:v0.2.0
     environment:
-      CALLBACK_URL: http://candidate-service:8080/receipts
+      CALLBACK_URL: http://payment-service:8080/receipts
     ports:
       - "8081:8081"
     networks:
       - payment-network
     depends_on:
-      - candidate-service
+      - payment-service
     restart: unless-stopped
 
 networks:

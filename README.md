@@ -28,7 +28,7 @@ payment-service/
 
 ## Быстрый старт.
 Клонирование и запуск:
-git clone https://github.com/YOUR_USERNAME/payment-service.git
+git clone https://github.com/Anton-Sergeev-EA/payment-service.git
 cd payment-service
 docker compose up --build
 
@@ -41,7 +41,7 @@ json
 ## Переменные окружения.
 Переменная	    Значение по умолчанию	                 Описание
 PROVIDER_URL	http://provider-simulator:8081	         Адрес внешнего провайдера
-CALLBACK_URL	http://candidate-service:8080/receipts	 Адрес для callback-квитанций
+CALLBACK_URL	http://payment-service:8080/receipts	 Адрес для callback-квитанций
 
 ## API сервис.
 GET /health.
@@ -302,11 +302,11 @@ curl -X POST http://localhost:8080/operations \
 
 curl -X POST http://localhost:8080/operations/recovery-test-1/submit
 # Перезапуск сервиса.
-docker compose restart candidate-service
+docker compose restart payment-service
 # Проверка восстановления операции.
 curl http://localhost:8080/operations/recovery-test-1
 # Проверка логов восстановления.
-docker compose logs candidate-service | grep "recovery"
+docker compose logs payment-service | grep "recovery"
 
 Сценарий 6: Проверка сохранности данных.
 # Создание операции.
@@ -338,7 +338,7 @@ curl -X POST http://localhost:8080/operations \
 # Отправка.
 curl -X POST http://localhost:8080/operations/retry-test-1/submit
 # Просмотр логов с attempt.
-docker compose logs candidate-service | grep "retry-test-1" | grep "attempt"
+docker compose logs payment-service | grep "retry-test-1" | grep "attempt"
 
 # Тестирование.
 ## Запуск тестов.
@@ -371,13 +371,13 @@ test_recovery.py	  Тестирование восстановления и со
 
 # Просмотр логов:
 ## Все логи.
-docker compose logs -f candidate-service
+docker compose logs -f payment-service
 ## Фильтр по operation_id.
-docker compose logs candidate-service | grep "operation-123"
+docker compose logs payment-service | grep "operation-123"
 ## Только ошибки.
-docker compose logs candidate-service | grep ERROR
+docker compose logs payment-service | grep ERROR
 ## Логи с attempt (retry).
-docker compose logs candidate-service | grep "attempt"
+docker compose logs payment-service | grep "attempt"
 
 # База данных.
 Используется SQLite с постоянным томом. Данные сохраняются при перезапуске контейнеров.
