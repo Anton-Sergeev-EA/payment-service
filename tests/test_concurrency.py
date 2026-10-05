@@ -16,26 +16,6 @@ async def client():
         yield client
 
 
-@pytest.fixture(autouse=True)
-async def clean_db():
-    """Clean database before each test."""
-    db.db_path = "/tmp/test_payments.db"
-    db._init_db()
-
-    async with db.get_connection() as conn:
-        await conn.execute("DELETE FROM operations")
-        await conn.execute("DELETE FROM events")
-        await conn.execute("DELETE FROM receipts")
-        await conn.execute("DELETE FROM processed_receipts")
-        await conn.commit()
-
-    yield
-
-    import os
-    if os.path.exists("/tmp/test_payments.db"):
-        os.remove("/tmp/test_payments.db")
-
-
 @pytest.mark.asyncio
 async def test_concurrent_submit(client):
     """Test concurrent submit requests for the same operation."""
